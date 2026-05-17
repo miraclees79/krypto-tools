@@ -540,7 +540,10 @@ def run_advanced_pipeline(
     )
     total_duration = str(timedelta(seconds=int(time.perf_counter() - start_time_global)))
     print(f"\n✅ Zakończono Shard {shard_index} zawierający {total_rows} podmiotów. Całkowity czas pracy: {total_duration}", flush=True)
-    
+    # KRYTYCZNA POPRAWKA:
+    # Wymusza natychmiastowe zamknięcie procesu Pythona, 
+    # zabijając wszystkie wiszące wątki-zombie.
+    os._exit(0)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
