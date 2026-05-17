@@ -1,3 +1,4 @@
+import concurrent.futures
 import os
 import math
 import time
@@ -96,7 +97,8 @@ class WebAnalyzer:
             return ""
         try:
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-            response = requests.get(url=url, headers=headers, timeout=5)
+            # POPRAWKA: timeout=(5, 30) oznacza 5s na połączenie i max 30s na oczekiwanie na dane
+            response = requests.get(url=url, headers=headers, timeout=(5, 30))
             if response.status_code == 200:
                 soup = BeautifulSoup(markup=response.text, features='html.parser')
                 for script in soup(name=["script", "style", "nav", "footer"]):
@@ -409,16 +411,18 @@ def run_advanced_pipeline(
     total_rows = len(df)
     start_time_global = time.perf_counter()
 
-    # Zastąpiona pętla z enumerate (bez tqdm) tak jak prosileś wcześniej
+    # Inicjalizacja puli wątków. Używamy więcej niż 1 worker, 
+    # aby w razie "zawieszenia" jednego wątku, kolejne mogły korzystać z wolnych.
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+
     for current_row, (index, row) in enumerate(df.iterrows(), start=1):
         start_time_row = time.perf_counter()
         company_name = str(row['Imię i Nazwisko / Nazwa firmy'])
         company_address = str(row['krs_adres_aktualny'])
         
-        # Logowanie postępu bez tqdm (czyste linie w GH Actions)
         print(f"[{index+1-start_idx}/{total_rows}] Analiza: {company_name[:50]}...", end=" ", flush=True)
 
-        # FILTROWANIE PODMIOTÓW AKTYWNYCH
+        # --- FILTROWANIE PODMIOTÓW AKTYWNYCH ---
         zawieszenie_ias = str(row.get('Informacja o zawieszeniu działalności', '')).strip().lower()
         zakonczenie_ias = str(row.get('Informacja o zakończeniu działalności', '')).strip().lower()
         krs_status = str(row.get('krs_status', '')).strip()
@@ -431,17 +435,17 @@ def run_advanced_pipeline(
         if not (is_active_ias and is_active_krs and not_liquidated):
             df.at[index, 'ai_summary'] = "Pominięto (podmiot nieaktywny, wykreślony lub zawieszony)."
             print("Pominięto (nieaktywny).", flush=True)
+            
+            # --- OBLICZENIA CZASOWE DLA POMINIĘTYCH ---
             end_time_row = time.perf_counter()
             duration_row = end_time_row - start_time_row
-        
             elapsed_total = end_time_row - start_time_global
             avg_time_per_row = elapsed_total / (index+1-start_idx)
             remaining_rows = total_rows - (index+1-start_idx)
             eta_seconds = remaining_rows * avg_time_per_row
-        
-            # Formatowanie czasów do czytelnej postaci HH:MM:SS
             elapsed_str = str(timedelta(seconds=int(elapsed_total)))
             eta_str = str(timedelta(seconds=int(eta_seconds)))
+            
             print(f"[{index+1-start_idx}/{total_rows}] "
                   f"({((index+1-start_idx)/total_rows)*100:.1f}%) "
                   f"| {company_name[:30].ljust(30)} "
@@ -452,15 +456,21 @@ def run_advanced_pipeline(
             continue
 
         main_shareholder = str(row.get('klaster_udzialowca_id', '')) 
-        urls = analyzer.find_websites(
-            company_name=company_name,
-            shareholder_name=main_shareholder,
-            company_address=company_address
-        )
-        
-        df.at[index, 'website_url'] = " | ".join(urls) if urls else ""
-        
-        if urls:
+
+        # =========================================================
+        # LOGIKA WĄTKU (WYKONYWANA W TLE)
+        # =========================================================
+        def analyze_single_company():
+            urls = analyzer.find_websites(
+                company_name=company_name,
+                shareholder_name=main_shareholder,
+                company_address=company_address
+            )
+            urls_str = " | ".join(urls) if urls else ""
+            
+            if not urls:
+                return "Nie znaleziono odpowiednich stron (po odrzuceniu śmieciowych agregatorów KRS).", "Brak stron.", urls_str
+                
             combined_text = ""
             for url in urls:
                 text = analyzer.scrape_website_text(url=url)
@@ -473,15 +483,31 @@ def run_advanced_pipeline(
                     company_address=company_address,
                     website_text=combined_text[:8000] 
                 )
-                df.at[index, 'ai_summary'] = summary
-                print("Sukces.")
+                return summary, "Sukces.", urls_str
             else:
-                df.at[index, 'ai_summary'] = "Nie udało się pobrać treści z żadnej ze znalezionych stron."
-                print("Błąd pobierania treści." , flush=True)
-        else:
-            df.at[index, 'ai_summary'] = "Nie znaleziono odpowiednich stron (po odrzuceniu śmieciowych agregatorów KRS)."
-            print("Brak stron.", flush=True)
-        # 3. Obliczenia czasowe
+                return "Nie udało się pobrać treści z żadnej ze znalezionych stron.", "Błąd pobierania treści.", urls_str
+
+        # =========================================================
+        # URUCHOMIENIE WĄTKU Z TWARDYM LIMITEM CZASU
+        # =========================================================
+        future = executor.submit(analyze_single_company)
+        try:
+            # Czekamy maksymalnie 600 sekund (10 minut)
+            ai_summary, status_msg, urls_string = future.result(timeout=600)
+            df.at[index, 'ai_summary'] = ai_summary
+            df.at[index, 'website_url'] = urls_string
+            print(status_msg, flush=True)
+            
+        except concurrent.futures.TimeoutError:
+            # Wątek zawiesił się na amen. Zostawiamy go samemu sobie (zombie thread) i idziemy dalej.
+            df.at[index, 'ai_summary'] = "BŁĄD KRYTYCZNY: Przekroczono limit czasu analizy (10 minut). Proces zawiesił się na tej stronie."
+            print("TIMEOUT (10 min)! Przerywam i przechodzę dalej.", flush=True)
+            
+        except Exception as e:
+            df.at[index, 'ai_summary'] = f"Wewnętrzny błąd skryptu: {str(e)}"
+            print(f"BŁĄD WEWNĘTRZNY: {str(e)}", flush=True)
+
+        # --- OBLICZENIA CZASOWE DLA WYKONANYCH ---
         end_time_row = time.perf_counter()
         duration_row = end_time_row - start_time_row
     
@@ -490,12 +516,9 @@ def run_advanced_pipeline(
         remaining_rows = total_rows - (index+1-start_idx)
         eta_seconds = remaining_rows * avg_time_per_row
     
-        # Formatowanie czasów do czytelnej postaci HH:MM:SS
         elapsed_str = str(timedelta(seconds=int(elapsed_total)))
         eta_str = str(timedelta(seconds=int(eta_seconds)))
 
-        # 4. Rozbudowany log do konsoli GitHub Actions
-        # Zawiera: postęp, nazwę, czas trwania wiersza, łączny czas i przewidywany koniec
         print(f"[{index+1-start_idx}/{total_rows}] "
               f"({((index+1-start_idx)/total_rows)*100:.1f}%) "
               f"| {company_name[:30].ljust(30)} "
@@ -503,7 +526,11 @@ def run_advanced_pipeline(
               f"| Łącznie: {elapsed_str} "
               f"| ETA: {eta_str} ",
               flush=True)
+              
         time.sleep(4)
+
+    # Zamknięcie puli wątków na koniec shardu
+    executor.shutdown(wait=False)
 
     print(f"\nZapisywanie fragmentu: {output_path}...", flush=True)
     df.to_csv(
@@ -512,7 +539,7 @@ def run_advanced_pipeline(
         encoding='utf-8'
     )
     total_duration = str(timedelta(seconds=int(time.perf_counter() - start_time_global)))
-    print(f"\n✅ Zakończono Shard {shard_index} zawierający {total_rows} podmiotów Całkowity czas pracy: {total_duration}", flush=True)
+    print(f"\n✅ Zakończono Shard {shard_index} zawierający {total_rows} podmiotów. Całkowity czas pracy: {total_duration}", flush=True)
     
 
 if __name__ == "__main__":
